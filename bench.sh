@@ -64,14 +64,26 @@ pub_ip(){
 # ---- 两机直连对测：ping 只能证明延迟和丢包，证明不了吞吐，必须实测 ----
 if [ "$MODE" = "server" ]; then
   command -v iperf3 >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get update -qq; apt-get install -y -qq iperf3 >/dev/null; }
+  # 云厂商安全组常常只放行了 443。443 是唯一已知一定能通的端口（中转链路正在用），
+  # 所以允许临时借用它：停掉 xray -> 测速 -> 退出时自动恢复。
+  if ss -lnt 2>/dev/null | grep -q ":${IPERF_PORT} "; then
+    if [ "$IPERF_PORT" = "443" ] && systemctl is-active --quiet xray 2>/dev/null; then
+      echo "${YLW}[!]${RST} 临时停止 xray 以借用 443 端口测速，脚本退出时会自动恢复"
+      systemctl stop xray
+      trap 'systemctl start xray >/dev/null 2>&1; echo; echo "${GRN}[+]${RST} xray 已自动恢复"' EXIT INT TERM
+    else
+      echo "${RED}[x]${RST} 端口 ${IPERF_PORT} 已被占用，换一个：IPERF_PORT=5202 bash \$0 --server"; exit 1
+    fi
+  fi
   line
-  echo "${BLD}iperf3 服务端已启动（临时，测完按 Ctrl+C 关掉）${RST}"
+  echo "${BLD}iperf3 服务端已启动，端口 ${IPERF_PORT}（测完按 Ctrl+C）${RST}"
   echo "在${BLD}中转机${RST}上执行："
   echo "  ${GRN}bash <(curl -fsSL https://raw.githubusercontent.com/yongtingzhengcn-web/vps-relay/main/bench.sh) --peer $(pub_ip):${IPERF_PORT}${RST}"
   echo
-  echo "若中转机连不上，多半是本机云控制台的安全组没放行 ${IPERF_PORT} 端口"
+  echo "若中转机连不上，说明本机安全组没放行 ${IPERF_PORT}；改用 443 重跑："
+  echo "  IPERF_PORT=443 bash <(curl -fsSL .../bench.sh) --server"
   line
-  exec iperf3 -s -p "$IPERF_PORT"
+  iperf3 -s -p "$IPERF_PORT"   # 不能用 exec，否则退出时的 trap 不会执行
 fi
 
 if [ "$MODE" = "peer" ]; then
