@@ -120,7 +120,41 @@ XanMod 内核里的 `bbr` **就是 BBRv3**（上游 BBRv3 补丁已合入，sysc
 
 ---
 
+## 三点五、已经装过了但连不通？跑 fix.sh
+
+`fix.sh` 修复已部署的实例，**不重新生成密钥，两台机器无需重新配对**。它做三件事：
+实测挑选可用的伪装站、修正权限、去掉危险的 sockopt 字段。
+
+**落地机(越南)先跑**，它会打印中转机该执行的命令：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yongtingzhengcn-web/vps-relay/main/fix.sh)
+```
+
+**中转机(香港)再跑**（`-l` 后面填上一步打印出来的落地机 SNI）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yongtingzhengcn-web/vps-relay/main/fix.sh) -l <落地机SNI>
+```
+
+中转机跑完会做端到端自检并打印新的客户端链接（伪装站变了，客户端链接也要跟着换）。
+
+---
+
 ## 四、排错
+
+**TCP 通、但代理毫无反应（客户端超时 / 自检 HTTP 000）**：
+九成是 **REALITY 伪装站(dest)** 的问题。REALITY 依赖伪装站的 TLS 握手，
+如果服务器到该站的握手不正常，即使 UUID / 公钥 / shortId 全对也连不上 —— 而且不会有明显报错。
+`www.microsoft.com` 是已知的问题站点。直接跑上面的 `fix.sh` 自动换成实测可用的。
+
+脚本现在会在部署时从**本机实测**挑选伪装站，要求同时满足 TLS1.3 + ALPN h2 + X25519 密钥交换，
+不再写死任何域名。手动验证某个域名是否能用：
+
+```bash
+printf 'HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' gateway.icloud.com | openssl s_client -connect gateway.icloud.com:443 -servername gateway.icloud.com -alpn h2 -tls1_3 2>/dev/null | grep -E 'ALPN|Protocol *:|group|Temp Key'
+```
+
 
 ```bash
 relay-info                      # 重新查看节点信息和链接

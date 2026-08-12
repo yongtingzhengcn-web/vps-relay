@@ -14,7 +14,7 @@ set -euo pipefail
 
 #------------------------------- 可调参数 -------------------------------------
 PORT=443                       # -p  本机对客户端监听的端口
-SNI="www.microsoft.com"        # -s  本机 REALITY 伪装域名
+SNI=""                         # -s  本机 REALITY 伪装域名；留空=从本机实测自动挑选
 VN_LINK=""                     # -l  越南落地机的 vless:// 链接
 CN_DIRECT=0                    # --cn-direct  国内网站在香港直接出，不绕越南
 DO_KERNEL=1                    # --no-kernel  跳过 XanMod 内核安装
@@ -34,7 +34,7 @@ usage(){
 用法: $0 -l 'vless://...' [选项]
   -l LINK        越南落地机输出的 vless:// 链接 (必填，记得用单引号包住)
   -p PORT        本机监听端口 (默认 443)
-  -s SNI         本机 REALITY 伪装域名 (默认 www.microsoft.com)
+  -s SNI         本机 REALITY 伪装域名；默认从本机实测自动挑选
   --cn-direct    命中 geosite:cn / geoip:cn 的流量在香港直接出，不绕越南
   -y             安装完 XanMod 内核后自动重启
   --no-kernel    不动内核，只装 Xray
@@ -108,6 +108,39 @@ info "安装依赖..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates openssl gnupg qrencode >/dev/null
+
+#------------------------------- 伪装站探测 -----------------------------------
+# 血泪教训：写死一个 dest（比如 www.microsoft.com）是这套方案最大的坑。
+# 若本机到该站的 TLS 握手不正常，即使 UUID/公钥/shortId 全对，客户端也连不上，
+# 症状是「TCP 通、但代理毫无反应」，极难排查。所以一律现场实测后再选。
+# 注意：这里选的只是本机对客户端的伪装站；对落地机的 SNI 来自落地链接，不能乱改。
+DEST_CANDIDATES="gateway.icloud.com www.apple.com addons.mozilla.org www.cloudflare.com dl.google.com www.samsung.com one-piece.com www.lovelive-anime.jp"
+
+probe_dest(){ # 同时满足 TLS1.3 + ALPN h2 + X25519 系密钥交换才算合格
+  local h="$1" out kex
+  out="$(printf 'HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$h" \
+        | timeout 12 openssl s_client -connect "$h:443" -servername "$h" -alpn h2 -tls1_3 2>/dev/null)" || return 1
+  grep -q 'ALPN protocol: h2' <<<"$out" || return 1
+  grep -qE 'Protocol *: *TLSv1\.3' <<<"$out" || return 1
+  kex="$(grep -oE '(Server Temp Key|Negotiated TLS1\.3 group): *[A-Za-z0-9_+-]+' <<<"$out" | head -1 | sed -E 's/.*: *//')"
+  case "${kex:-}" in X25519*) return 0 ;; *) return 1 ;; esac
+}
+
+select_sni(){
+  if [ -n "$SNI" ]; then
+    info "使用手动指定的伪装站 ${SNI}，实测验证中..."
+    probe_dest "$SNI" && ok "${SNI} 实测合格" || warn "${SNI} 实测不合格，仍按你的要求写入（可能连不通）"
+    return 0
+  fi
+  info "实测挑选本机对客户端的 REALITY 伪装站..."
+  local h
+  for h in $DEST_CANDIDATES; do
+    printf '    %-24s' "$h"
+    if probe_dest "$h"; then echo "${GRN}合格${RST}"; SNI="$h"; break; else echo "${YLW}不合格${RST}"; fi
+  done
+  [ -n "$SNI" ] || die "候选伪装站全部不合格，本机网络可能有问题；可用 -s 手动指定"
+  ok "选定伪装站: ${BLD}${SNI}${RST}"
+}
 
 #------------------------------- 网络栈调优 -----------------------------------
 tune_sysctl(){
@@ -274,7 +307,7 @@ write_config(){
           "privateKey": "${PRIVATE_KEY}",
           "shortIds": [ "${SHORT_ID}" ]
         },
-        "sockopt": { "tcpFastOpen": true, "tcpNoDelay": true }
+        "sockopt": { "tcpNoDelay": true }
       },
       "sniffing": {
         "enabled": true,
@@ -315,12 +348,7 @@ write_config(){
           "shortId": "${VN_SID}",
           "spiderX": "/"
         },
-        "sockopt": {
-          "tcpFastOpen": true,
-          "tcpNoDelay": true,
-          "tcpKeepAliveInterval": 15,
-          "tcpcongestion": "bbr"
-        }
+        "sockopt": { "tcpNoDelay": true, "tcpKeepAliveInterval": 15 }
       }
     },
     {
@@ -415,6 +443,7 @@ pub_ip(){
 line
 echo "${BLD}香港中转机部署 — VLESS+REALITY 入口，链式出站到越南${RST}"
 line
+select_sni
 tune_sysctl
 install_xray
 gen_creds
