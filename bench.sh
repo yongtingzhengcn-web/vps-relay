@@ -17,6 +17,18 @@ CONFIG=/usr/local/etc/xray/config.json
 SOCKS=10808
 BYTES=${BYTES:-50000000}      # 每流下载字节数，默认 50MB
 URL="https://speed.cloudflare.com/__down?bytes=${BYTES}"
+IPERF_PORT=${IPERF_PORT:-5201}
+MODE=""                       # --server / --peer
+PEER=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --server) MODE=server; shift ;;
+    --peer)   MODE=peer; PEER="${2:?}"; shift 2 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "未知参数: $1"; exit 1 ;;
+  esac
+done
 
 GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; CYN=$'\033[36m'; BLD=$'\033[1m'; RST=$'\033[0m'
 info(){ echo "${CYN}[*]${RST} $*"; }
@@ -39,6 +51,46 @@ dl_par(){ # 4 并发，回显合计 字节/秒
   rm -rf "$d"
   echo "$total"
 }
+
+pub_ip(){
+  local ip=""
+  for u in "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
+    ip="$(curl -4 -fsS --max-time 6 "$u" 2>/dev/null | tr -d '[:space:]')" || true
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+  done
+  ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7; exit}'
+}
+
+# ---- 两机直连对测：ping 只能证明延迟和丢包，证明不了吞吐，必须实测 ----
+if [ "$MODE" = "server" ]; then
+  command -v iperf3 >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get update -qq; apt-get install -y -qq iperf3 >/dev/null; }
+  line
+  echo "${BLD}iperf3 服务端已启动（临时，测完按 Ctrl+C 关掉）${RST}"
+  echo "在${BLD}中转机${RST}上执行："
+  echo "  ${GRN}bash <(curl -fsSL https://raw.githubusercontent.com/yongtingzhengcn-web/vps-relay/main/bench.sh) --peer $(pub_ip):${IPERF_PORT}${RST}"
+  echo
+  echo "若中转机连不上，多半是本机云控制台的安全组没放行 ${IPERF_PORT} 端口"
+  line
+  exec iperf3 -s -p "$IPERF_PORT"
+fi
+
+if [ "$MODE" = "peer" ]; then
+  command -v iperf3 >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get update -qq; apt-get install -y -qq iperf3 >/dev/null; }
+  PH="${PEER%%:*}"; PP="${PEER##*:}"; [ "$PP" = "$PH" ] && PP="$IPERF_PORT"
+  line
+  echo "${BLD}中转机 <-> 落地机 裸 TCP 吞吐（不经 Xray，纯网络能力）${RST}"
+  line
+  echo "→ 上行 4 并发："
+  iperf3 -c "$PH" -p "$PP" -t 10 -P 4 2>&1 | tail -4
+  echo "← 下行 4 并发："
+  iperf3 -c "$PH" -p "$PP" -t 10 -P 4 -R 2>&1 | tail -4
+  line
+  echo "把这个数字和「经完整中转链路」的速度对比："
+  echo "  两者接近      -> 瓶颈是这条国际线路本身，Xray 已经跑满了它，调参数无用"
+  echo "  裸 TCP 明显更快 -> 瓶颈在 Xray/CPU，值得优化"
+  line
+  exit 0
+fi
 
 line
 echo "${BLD}分段测速${RST}   每流 $((BYTES/1000000))MB"
