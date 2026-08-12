@@ -72,7 +72,7 @@ fi
 # 候选顺序 = 全球可达性 + TLS1.3/H2 稳定性；刻意不含 microsoft.com（本次故障源）
 DEST_CANDIDATES="gateway.icloud.com www.apple.com addons.mozilla.org www.cloudflare.com dl.google.com www.samsung.com one-piece.com www.lovelive-anime.jp"
 
-probe_dest(){ # $1=域名；同时满足 TLS1.3 + ALPN h2 + X25519 系密钥交换才算合格
+probe_dest(){ # 快速预筛：TLS1.3 + ALPN h2 + X25519。只能排除明显不可用的，不足以定生死
   local h="$1" out kex
   out="$(printf 'HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$h" \
         | timeout 12 openssl s_client -connect "$h:443" -servername "$h" -alpn h2 -tls1_3 2>/dev/null)" || return 1
@@ -81,6 +81,69 @@ probe_dest(){ # $1=域名；同时满足 TLS1.3 + ALPN h2 + X25519 系密钥交�
   kex="$(grep -oE '(Server Temp Key|Negotiated TLS1\.3 group): *[A-Za-z0-9_+-]+' <<<"$out" | head -1 | sed -E 's/.*: *//')"
   case "${kex:-}" in X25519*) return 0 ;; *) return 1 ;; esac
 }
+
+# 唯一可靠的判据：在本机起一对临时 REALITY 服务端/客户端，用候选域名真跑一遍握手。
+# 为什么必须这样测：www.microsoft.com 的 TLS1.3/h2/X25519 全部合格，但它的证书链有
+# 8273 字节，超出 REALITY 中转握手能容纳的大小，握手必定失败 —— 只查特性根本发现不了。
+TEST_URL=""
+pick_test_url(){
+  local u code
+  for u in https://www.gstatic.com/generate_204 https://cp.cloudflare.com/generate_204 https://api.ipify.org; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$u" 2>/dev/null || echo 000)"
+    case "$code" in 200|204) TEST_URL="$u"; return 0 ;; esac
+  done
+  return 1
+}
+
+free_port(){
+  local p i
+  for i in 1 2 3 4 5 6 7 8; do
+    p=$(( (RANDOM % 20000) + 30000 ))
+    ss -lnt 2>/dev/null | grep -q ":${p} " || { echo "$p"; return 0; }
+  done
+  echo "$(( (RANDOM % 20000) + 30000 ))"
+}
+
+reality_handshake_ok(){ # $1=候选 dest
+  local DEST="$1" sd sp cp2 kp priv pub uuid sid code S C i
+  [ -n "$TEST_URL" ] || return 1
+  sd="$(mktemp -d)"; sp="$(free_port)"; cp2="$(free_port)"
+  kp="$(xray x25519)"
+  priv="$(awk '/[Pp]rivate/{print $NF; exit}' <<<"$kp")"
+  pub="$(awk '/[Pp]assword/{print $NF; exit}' <<<"$kp")"
+  [ -n "$pub" ] || pub="$(awk '/[Pp]ublic/{print $NF; exit}' <<<"$kp")"
+  uuid="$(xray uuid)"; sid="$(openssl rand -hex 8)"
+  cat > "$sd/s.json" <<EOF
+{ "log":{"loglevel":"warning"},
+  "inbounds":[{"listen":"127.0.0.1","port":${sp},"protocol":"vless",
+    "settings":{"clients":[{"id":"${uuid}","flow":"xtls-rprx-vision"}],"decryption":"none"},
+    "streamSettings":{"network":"tcp","security":"reality","realitySettings":{
+      "show":false,"dest":"${DEST}:443","xver":0,"serverNames":["${DEST}"],
+      "privateKey":"${priv}","shortIds":["${sid}"]}}}],
+  "outbounds":[{"protocol":"freedom","settings":{"domainStrategy":"UseIP"}}] }
+EOF
+  cat > "$sd/c.json" <<EOF
+{ "log":{"loglevel":"warning"},
+  "inbounds":[{"listen":"127.0.0.1","port":${cp2},"protocol":"socks","settings":{"auth":"noauth"}}],
+  "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":${sp},
+      "users":[{"id":"${uuid}","encryption":"none","flow":"xtls-rprx-vision"}]}]},
+    "streamSettings":{"network":"tcp","security":"reality","realitySettings":{
+      "serverName":"${DEST}","fingerprint":"chrome","password":"${pub}","shortId":"${sid}","spiderX":"/"}}}] }
+EOF
+  xray run -c "$sd/s.json" >"$sd/s.log" 2>&1 & S=$!
+  xray run -c "$sd/c.json" >"$sd/c.log" 2>&1 & C=$!
+  for i in $(seq 1 24); do
+    ss -lnt 2>/dev/null | grep -q ":${cp2} " && break
+    sleep 0.25
+  done
+  code="$(curl -x "socks5h://127.0.0.1:${cp2}" -s -o /dev/null -w '%{http_code}' --max-time 12 "$TEST_URL" 2>/dev/null || echo 000)"
+  kill "$S" "$C" 2>/dev/null || true
+  wait "$S" 2>/dev/null || true; wait "$C" 2>/dev/null || true
+  rm -rf "$sd"
+  case "$code" in 200|204) return 0 ;; *) return 1 ;; esac
+}
+
+dest_ok(){ probe_dest "$1" && reality_handshake_ok "$1"; }
 
 CUR_SNI="$(python3 - "$CONFIG" <<'PY'
 import json,sys
@@ -92,26 +155,30 @@ else: print('')
 PY
 )"
 
+pick_test_url || die "本机连不上任何测试地址，无法验证伪装站；请先检查这台机器的出网"
+info "连通性测试地址: ${TEST_URL}"
+
 if [ -z "$MY_SNI" ]; then
-  info "从本机实测挑选 REALITY 伪装站（这是本次连不通的主因，必须现场验证）..."
+  info "实测挑选 REALITY 伪装站（每个候选都真跑一遍握手，约几秒一个）..."
   if [ -n "$CUR_SNI" ]; then
-    if probe_dest "$CUR_SNI"; then
-      ok "当前的 ${CUR_SNI} 实测合格，保持不变"
-      MY_SNI="$CUR_SNI"
+    printf '    当前的 %-22s' "$CUR_SNI"
+    if dest_ok "$CUR_SNI"; then
+      echo "${GRN}握手成功，保持不变${RST}"; MY_SNI="$CUR_SNI"
     else
-      warn "当前的 ${CUR_SNI} 从本机握手不合格 —— 这就是连不通的原因，换掉它"
+      echo "${RED}握手失败 —— 这就是连不通的原因${RST}"
     fi
   fi
   if [ -z "$MY_SNI" ]; then
     for h in $DEST_CANDIDATES; do
-      printf '    测试 %-24s' "$h"
-      if probe_dest "$h"; then echo "${GRN}合格${RST}"; MY_SNI="$h"; break; else echo "${YLW}不合格${RST}"; fi
+      printf '    %-24s' "$h"
+      if dest_ok "$h"; then echo "${GRN}握手成功${RST}"; MY_SNI="$h"; break; else echo "${YLW}不可用${RST}"; fi
     done
   fi
-  [ -n "$MY_SNI" ] || die "候选伪装站全部不合格，本机网络可能有问题。可用 -s 手动指定一个"
+  [ -n "$MY_SNI" ] || die "候选伪装站全部不可用，本机网络可能有问题。可用 -s 手动指定一个"
 else
-  info "使用手动指定的伪装站 ${MY_SNI}，实测验证中..."
-  probe_dest "$MY_SNI" || warn "${MY_SNI} 实测不合格，仍按你的要求写入（可能连不通）"
+  info "验证手动指定的伪装站 ${MY_SNI}（真实握手测试）..."
+  if dest_ok "$MY_SNI"; then ok "${MY_SNI} 握手成功"
+  else warn "${MY_SNI} 握手失败，仍按你的要求写入（很可能连不通）"; fi
 fi
 ok "本机伪装站(SNI) = ${BLD}${MY_SNI}${RST}"
 
