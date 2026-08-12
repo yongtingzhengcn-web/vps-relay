@@ -16,6 +16,19 @@
 
 ---
 
+## 〇、前置
+
+以 **root** 运行。Debian/Ubuntu 精简镜像常常连 `curl` 都没有，先补上：
+
+```bash
+apt update && apt install -y curl
+```
+
+报 `curl: command not found` 就是这个原因。只有 `wget` 的机器可以把下面所有
+`bash <(curl -fsSL URL)` 换成 `bash <(wget -qO- URL)`，效果一样。
+
+---
+
 ## 一、部署顺序（必须先越南、后香港）
 
 ### 第 1 步：越南落地机
