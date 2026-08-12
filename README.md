@@ -85,7 +85,7 @@ XanMod 内核里的 `bbr` **就是 BBRv3**（上游 BBRv3 补丁已合入，sysc
 | 参数 | 说明 |
 |---|---|
 | `-p PORT` | 监听端口，默认 `443` |
-| `-s SNI` | REALITY 伪装域名，默认 `www.microsoft.com`（须支持 TLS1.3 + H2） |
+| `-s SNI` | REALITY 伪装域名；**默认从本机实测自动挑选**，一般不用手动指定 |
 | `-y` | 装完内核自动重启 |
 | `--no-kernel` | 不动内核，只装 Xray |
 
