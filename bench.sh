@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+#==============================================================================
+#  bench.sh  —  分段测速，定位中转链路的瓶颈到底在哪一段
+#
+#  两台机器上都跑一遍，然后对比结果：
+#    落地机(越南) 直连下载慢      -> 越南机本身的国际带宽就不行，换机器或换线路
+#    中转机(香港) 直连下载快      -> 香港侧没问题
+#    香港经链路下载慢             -> 瓶颈在 香港->越南 这一跳
+#
+#  关键区分：单流 vs 4 并发
+#    单流慢、并发快  -> 丢包/高延迟导致的单流受限，不是带宽不够
+#    单流慢、并发也慢 -> 真的是带宽上限或线路拥塞
+#==============================================================================
+set -uo pipefail
+
+CONFIG=/usr/local/etc/xray/config.json
+SOCKS=10808
+BYTES=${BYTES:-50000000}      # 每流下载字节数，默认 50MB
+URL="https://speed.cloudflare.com/__down?bytes=${BYTES}"
+
+GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; CYN=$'\033[36m'; BLD=$'\033[1m'; RST=$'\033[0m'
+info(){ echo "${CYN}[*]${RST} $*"; }
+line(){ printf '%s\n' "------------------------------------------------------------"; }
+
+mbps(){ awk -v b="$1" 'BEGIN{printf "%.1f", b*8/1000000}'; }
+
+dl_one(){ # 单流，回显 字节/秒
+  curl -o /dev/null -s --max-time 30 -w '%{speed_download}' "$1" ${2:+-x "$2"} 2>/dev/null || echo 0
+}
+
+dl_par(){ # 4 并发，回显合计 字节/秒
+  local url="$1" proxy="${2:-}" d i total=0 s
+  d="$(mktemp -d)"
+  for i in 1 2 3 4; do
+    ( curl -o /dev/null -s --max-time 30 -w '%{speed_download}' "$url" ${proxy:+-x "$proxy"} 2>/dev/null > "$d/$i" || echo 0 > "$d/$i" ) &
+  done
+  wait
+  for i in 1 2 3 4; do s="$(cat "$d/$i" 2>/dev/null || echo 0)"; total="$(awk -v a="$total" -v b="${s:-0}" 'BEGIN{print a+b}')"; done
+  rm -rf "$d"
+  echo "$total"
+}
+
+line
+echo "${BLD}分段测速${RST}   每流 $((BYTES/1000000))MB"
+line
+
+# ---- 基础环境 ----
+echo "内核      : $(uname -r)"
+echo "拥塞控制  : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)  队列: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+echo "CPU       : $(nproc) 核  $(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo | sed 's/^ *//')"
+echo "接收缓冲  : $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}') 字节"
+line
+
+# ---- 角色 ----
+ROLE=landing
+if [ -f "$CONFIG" ] && command -v python3 >/dev/null 2>&1; then
+  ROLE="$(python3 - "$CONFIG" <<'PY' 2>/dev/null || echo landing
+import json,sys
+d=json.load(open(sys.argv[1]))
+print('relay' if any((o.get('streamSettings') or {}).get('realitySettings') for o in d.get('outbounds',[])) else 'landing')
+PY
+)"
+fi
+echo "本机角色  : ${BLD}${ROLE}${RST}"
+line
+
+# ---- 本机直连测速 ----
+info "① 本机直连下载（不经过任何代理）..."
+S1="$(dl_one "$URL")";  echo "   单流   : ${BLD}$(mbps "$S1") Mbps${RST}"
+P1="$(dl_par "$URL")";  echo "   4 并发 : ${BLD}$(mbps "$P1") Mbps${RST}"
+line
+
+if [ "$ROLE" = "relay" ]; then
+  VN="$(python3 - "$CONFIG" <<'PY' 2>/dev/null
+import json,sys
+d=json.load(open(sys.argv[1]))
+for o in d.get('outbounds',[]):
+    if (o.get('streamSettings') or {}).get('realitySettings'):
+        v=(o.get('settings') or {}).get('vnext') or [{}]
+        print(v[0].get('address','')); break
+PY
+)"
+  if [ -n "${VN:-}" ]; then
+    info "② 香港 -> 越南 链路质量（延迟与丢包，丢包才是单流慢的元凶）..."
+    ping -c 20 -i 0.2 -W 2 "$VN" 2>/dev/null | tail -3 || echo "   落地机不回应 ICMP"
+    line
+  fi
+  info "③ 经完整中转链路下载（香港 -> 越南 -> 互联网）..."
+  S2="$(dl_one "$URL" "socks5h://127.0.0.1:${SOCKS}")"; echo "   单流   : ${BLD}$(mbps "$S2") Mbps${RST}"
+  P2="$(dl_par "$URL" "socks5h://127.0.0.1:${SOCKS}")"; echo "   4 并发 : ${BLD}$(mbps "$P2") Mbps${RST}"
+  line
+  echo "${BLD}判读${RST}"
+  R_ONE="$(awk -v a="$S2" -v b="$S1" 'BEGIN{printf "%.0f", (b>0? a*100/b : 0)}')"
+  R_PAR="$(awk -v a="$P2" -v b="$P1" 'BEGIN{printf "%.0f", (b>0? a*100/b : 0)}')"
+  echo "   中转后单流保留了本机直连的 ${R_ONE}%，并发保留了 ${R_PAR}%"
+  if [ "${R_PAR:-0}" -lt 40 ] 2>/dev/null; then
+    echo "   ${RED}并发也掉得厉害${RST} -> 瓶颈在 香港->越南 这一跳（国际线路拥塞或越南机带宽小）"
+    echo "     这一段换不了协议来解决，只能换落地机机房 / 换更好的中转线路"
+  elif [ "${R_ONE:-0}" -lt 40 ]; then
+    echo "   ${YLW}单流掉得厉害但并发还行${RST} -> 丢包/高延迟导致的单流受限，不是带宽不够"
+    echo "     客户端开多路复用或多线程下载能明显改善；上面 ping 的丢包率是关键证据"
+  else
+    echo "   ${GRN}中转损耗正常${RST} -> 瓶颈更可能在 你->香港 这一段（本地宽带或回国线路）"
+    echo "     在本地对香港机做一次 speedtest 对比即可确认"
+  fi
+  line
+fi
+echo "提示：想测更久更准，用 BYTES=200000000 bash bench.sh"
