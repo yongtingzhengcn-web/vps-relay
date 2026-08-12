@@ -136,6 +136,24 @@ xray -test -config /usr/local/etc/xray/config.json   # 校验配置
 3. 链接复制不完整（没加单引号，`&` 后面被吃掉了）
 4. 两台机器的 Xray 版本差太多 → 都重跑一遍脚本升到最新
 
+**香港自检报 TCP 被拒绝（Connection refused）**：这**不是**防火墙问题。
+防火墙丢包表现为超时，收到 RST 说明主机可达、但端口上没进程在监听 —— 去越南机查 Xray：
+
+```bash
+systemctl status xray; journalctl -u xray -n 30 --no-pager
+```
+
+若日志是 `open /usr/local/etc/xray/config.json: permission denied`（exit 23），
+说明配置目录权限被收紧了，而 Xray 以 `nobody` 身份运行：
+
+```bash
+chmod 0755 /usr/local/etc/xray && systemctl restart xray
+```
+
+**Loon 客户端连不上**：Loon 扫 `vless://` 二维码经常丢掉 `pbk` / `sid` / `flow` 参数。
+香港脚本结尾会额外打印一行 Loon 原生格式配置，直接粘进 Loon 配置文件的 `[Proxy]` 段更可靠。
+随时可以用 `relay-info` 里的 `LOON=` 那行取回。另外 **Loon 需要较新版本才支持 REALITY**，旧版无论怎么配都连不通。
+
 **客户端连不上但香港自检是通的**：多半是客户端版本太老。
 Xray v25 起 REALITY 客户端字段从 `publicKey` 改名为 `password`，脚本会按核心实际输出自适应，
 但老客户端可能只认原始公钥 —— `relay-info` 里的 `RAW_PUBLIC_KEY` 就是备用值，替换链接里的 `pbk=` 再试。

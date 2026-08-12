@@ -314,7 +314,8 @@ IP="$(pub_ip)"
 
 LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${AUTH_VALUE}&sid=${SHORT_ID}&type=tcp&headerType=none&spx=%2F#${TAG}"
 
-install -d -m 0700 /usr/local/etc/xray
+# 注意：不要收紧 /usr/local/etc/xray 目录权限。
+# Xray 以 nobody 身份运行，目录一旦变成 0700，重启后就读不到 config.json（exit 23）。
 cat > /usr/local/etc/xray/relay-info.txt <<EOF
 # 越南落地机 (出口) — 生成于 $(date -Is)
 ROLE=landing
@@ -334,6 +335,24 @@ cat > /usr/local/bin/relay-info <<'EOF'
 cat /usr/local/etc/xray/relay-info.txt
 EOF
 chmod +x /usr/local/bin/relay-info
+
+# 收尾复核：所有文件写完之后再重启一次，确认 xray 能以 nobody 身份真正拉起来。
+# 之前踩过的坑：写凭据时把配置目录改成 0700，当时进程还活着看不出问题，重启后必挂 (exit 23)。
+info "收尾复核：重启 Xray 并确认服务存活..."
+chmod 0755 /usr/local/etc/xray
+chmod 0644 /usr/local/etc/xray/config.json
+systemctl restart xray
+sleep 1
+if systemctl is-active --quiet xray; then
+  if command -v ss >/dev/null 2>&1 && ! ss -lnt 2>/dev/null | grep -q ":${PORT} "; then
+    warn "服务在跑，但没看到 :${PORT} 的监听，请手动检查 ss -lntp"
+  else
+    ok "Xray 重启后正常监听 :${PORT}"
+  fi
+else
+  journalctl -u xray -n 20 --no-pager
+  die "Xray 重启后启动失败（上面是日志）"
+fi
 
 echo
 line

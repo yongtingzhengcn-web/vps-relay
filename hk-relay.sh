@@ -360,13 +360,36 @@ self_test(){
     warn "落地机没回应 ICMP（多数 VPS 默认封 ping，不影响使用）"
   fi
 
+  # 先测裸 TCP。"拒绝"和"超时"是两种完全不同的病，修法也完全不同，必须分开报
+  local tcpok=0 tcperr=""
+  tcperr="$(timeout 5 bash -c "cat < /dev/null > /dev/tcp/${VN_HOST}/${VN_PORT}" 2>&1)" && tcpok=1 || tcpok=0
+  if [ "$tcpok" -eq 1 ]; then
+    ok "TCP 可达 ${VN_HOST}:${VN_PORT}"
+  else
+    case "$tcperr" in
+      *efused*)
+        warn "TCP 被拒绝（收到 RST）—— 落地机可达，但 ${VN_PORT} 端口上没有进程在监听"
+        warn "  这不是防火墙问题。去越南机上查 Xray 为什么没起来："
+        warn "    systemctl status xray; journalctl -u xray -n 30 --no-pager"
+        ;;
+      *)
+        warn "TCP 超时/不可达 —— 数据包被丢弃，是防火墙或安全组"
+        warn "  1) 越南机若用了 -a，放行的必须是香港机的出站 IP"
+        warn "  2) 检查越南 VPS 控制台的安全组有没有放行 ${VN_PORT}"
+        ;;
+    esac
+  fi
+
   code="$(curl -x "socks5h://127.0.0.1:${SOCKS_TEST_PORT}" -s -o /dev/null -w '%{http_code}' \
-          --max-time 15 https://www.gstatic.com/generate_204 2>/dev/null || echo 000)"
+          --max-time 15 https://www.gstatic.com/generate_204 2>/dev/null)" || true
+  [ -n "$code" ] || code="000"
   if [ "$code" = "204" ] || [ "$code" = "200" ]; then
     ok "链路打通（HTTP ${code}）"
   else
     warn "经落地机访问外网失败 (HTTP ${code})"
-    warn "常见原因：越南机防火墙用 -a 限制了别的 IP / 端口没放行 / 链接复制不完整"
+    if [ "$tcpok" -eq 1 ]; then
+      warn "TCP 是通的，那就是 REALITY 参数对不上：多半链接复制不完整（漏了单引号，& 后面被 shell 吃掉）"
+    fi
   fi
 
   exit_ip="$(curl -x "socks5h://127.0.0.1:${SOCKS_TEST_PORT}" -s --max-time 15 https://api.ipify.org 2>/dev/null || true)"
@@ -404,6 +427,9 @@ IP="$(pub_ip)"
 
 LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${AUTH_VALUE}&sid=${SHORT_ID}&type=tcp&headerType=none&spx=%2F#${TAG}"
 
+# Loon 扫 vless:// 二维码经常丢掉 pbk / sid / flow，所以额外给一行原生格式
+LOON_LINE="${TAG} = VLESS,${IP},${PORT},\"${UUID}\",transport=tcp,over-tls=true,sni=${SNI},flow=xtls-rprx-vision,public-key=\"${AUTH_VALUE}\",short-id=${SHORT_ID},udp=true,skip-cert-verify=true"
+
 cat > /usr/local/etc/xray/relay-info.txt <<EOF
 # 香港中转机 (入口) — 生成于 $(date -Is)
 ROLE=relay
@@ -416,6 +442,7 @@ PUBLIC_KEY_OR_PASSWORD=${AUTH_VALUE}
 RAW_PUBLIC_KEY=${PUBLIC_KEY}
 LANDING=${VN_HOST}:${VN_PORT}
 LINK=${LINK}
+LOON=${LOON_LINE}
 EOF
 chmod 600 /usr/local/etc/xray/relay-info.txt
 
@@ -424,6 +451,24 @@ cat > /usr/local/bin/relay-info <<'EOF'
 cat /usr/local/etc/xray/relay-info.txt
 EOF
 chmod +x /usr/local/bin/relay-info
+
+# 收尾复核：所有文件写完之后再重启一次，确认 xray 能以 nobody 身份真正拉起来。
+# 之前踩过的坑：写凭据时把配置目录改成 0700，当时进程还活着看不出问题，重启后必挂 (exit 23)。
+info "收尾复核：重启 Xray 并确认服务存活..."
+chmod 0755 /usr/local/etc/xray
+chmod 0644 /usr/local/etc/xray/config.json
+systemctl restart xray
+sleep 1
+if systemctl is-active --quiet xray; then
+  if command -v ss >/dev/null 2>&1 && ! ss -lnt 2>/dev/null | grep -q ":${PORT} "; then
+    warn "服务在跑，但没看到 :${PORT} 的监听，请手动检查 ss -lntp"
+  else
+    ok "Xray 重启后正常监听 :${PORT}"
+  fi
+else
+  journalctl -u xray -n 20 --no-pager
+  die "Xray 重启后启动失败（上面是日志）"
+fi
 
 echo
 line
@@ -442,6 +487,12 @@ echo
 if command -v qrencode >/dev/null 2>&1; then
   qrencode -t ANSIUTF8 "$LINK" || true
 fi
+line
+echo "${BLD}Loon 用户注意${RST}：Loon 扫二维码常把 pbk / sid / flow 丢掉，直接粘下面这行原生配置更可靠"
+echo "（另需 Loon 版本较新，旧版本不支持 REALITY）："
+echo
+echo "${CYN}${LOON_LINE}${RST}"
+echo
 line
 if [ -n "$PUBLIC_KEY" ] && [ "$PUBLIC_KEY" != "$AUTH_VALUE" ]; then
   echo "若客户端版本较老连不上，把链接里的 ${BLD}pbk=${RST} 换成原始公钥再试： ${PUBLIC_KEY}"
